@@ -155,6 +155,37 @@ export MC_INTRANODE_NVLINK=true
 ```
 The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`.
 
+#### Non-RDMA transports
+
+When prefill and decode are connected by plain Ethernet (no RoCE / InfiniBand HCA), Mooncake moves KV cache over its TCP transport, and SGLang exposes that path and the kernel-bypass variants as aliases of the `mooncake` backend. Use the same transport on the prefill and the decode server; `--disaggregation-ib-device` is ignored for these aliases.
+
+| Setting | Effect |
+| --- | --- |
+| `--disaggregation-transfer-backend mooncake_tcp` | Rewrites the backend to `mooncake` and sets `MC_FORCE_TCP`, so Mooncake installs its TCP transport instead of RDMA. |
+| `--disaggregation-transfer-backend mooncake_dpdk` | Rewrites the backend to `mooncake` and sets `MOONCAKE_PROTOCOL=dpdk` (experimental kernel-bypass transport; needs a Mooncake build with DPDK support and `MC_DPDK_PORTS` pointing at the NIC ports). |
+| `MOONCAKE_PROTOCOL` | Transport protocol passed to the Mooncake transfer engine (`rdma`, `tcp`, `dpdk`, ...). Default `rdma`; the aliases above set it for you. |
+| `MC_TCP_IO_BACKEND=io_uring` | Runs the TCP transport data plane on io_uring instead of asio (default `asio`). It is wire-compatible with asio peers, so the two sides may differ; when the kernel or the seccomp profile refuses `io_uring_setup`, Mooncake logs a warning and stays on asio. |
+| `MC_TCP_ZC=1` | Enables dmabuf zero copy on the TCP transport (io_uring zero-copy receive into GPU memory, devmem TCP transmit from GPU memory). Needs kernel 6.16 or newer and a NIC with header/data split; falls back to the staged path otherwise. |
+| `SGLANG_DISAGGREGATION_ASYNC_TRANSFER=1` | Submits KV batches with `batch_transfer_async_write` and polls `get_batch_transfer_status` instead of blocking a worker thread per batch, so one transfer worker keeps several batches in flight. Falls back to synchronous transfers on a Mooncake wheel without the async API. |
+| `SGLANG_HICACHE_FILE_BACKEND_IO=io_uring` | For `--hicache-storage-backend hf3fs`: use the local io_uring client (`mooncake.uring`) with O_DIRECT on a local NVMe file instead of the 3FS usrbio client. Equivalent to `{"client": "uring"}` in `--hicache-storage-backend-extra-config`. |
+
+```bash
+# Both servers: TCP transport on io_uring, submit/poll data plane.
+export MC_TCP_IO_BACKEND=io_uring
+export SGLANG_DISAGGREGATION_ASYNC_TRANSFER=1
+
+# prefill
+python -m sglang.launch_server --model-path $MODEL_PATH --disaggregation-mode prefill \
+  --disaggregation-transfer-backend mooncake_tcp --port 30000
+# decode
+python -m sglang.launch_server --model-path $MODEL_PATH --disaggregation-mode decode \
+  --disaggregation-transfer-backend mooncake_tcp --base-gpu-id 1 --port 30001
+```
+
+<Note>
+Docker 25 and later block `io_uring_setup`, `io_uring_enter` and `io_uring_register` in the default seccomp profile, and containerd / most Kubernetes runtimes copy that profile. Run the container with a seccomp profile that allows those three syscalls (or `--security-opt seccomp=unconfined`, and `securityContext.seccompProfile` on Kubernetes); otherwise `MC_TCP_IO_BACKEND=io_uring` silently stays on asio and the HiCache io_uring client cannot open its ring.
+</Note>
+
 #### Prefill Server Configuration
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>

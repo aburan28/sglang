@@ -127,9 +127,9 @@ class MooncakeTransferEngine:
         self.engine = TransferEngine()
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
-        # MC_FORCE_TCP=1 makes mooncake install TcpTransport instead of RDMA,
+        # MC_FORCE_TCP makes mooncake install TcpTransport instead of RDMA,
         # in which case RDMA HCA selection is irrelevant; pass empty device.
-        if os.environ.get("MC_FORCE_TCP") == "1":
+        if envs.MC_FORCE_TCP.get():
             self.ib_device = ""
         else:
             self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
@@ -267,6 +267,61 @@ class MooncakeTransferEngine:
                 session_id,
                 peer_buffer_addresses,
             )
+        return ret
+
+    # The binding reports a failed submit as batch id 0 (batch_id_t is unsigned);
+    # the wrapper maps it here so "id > 0" means submitted.
+    ASYNC_SUBMIT_FAILED = -1
+
+    def supports_async_transfer(self) -> bool:
+        """Whether the installed mooncake wheel exposes the submit/poll API."""
+        return hasattr(self.engine, "batch_transfer_async_write") and hasattr(
+            self.engine, "get_batch_transfer_status"
+        )
+
+    def batch_transfer_async(
+        self,
+        session_id: str,
+        buffers: List[int],
+        peer_buffer_addresses: List[int],
+        lengths: List[int],
+    ) -> int:
+        """Submit a batch write; returns the batch id (> 0) to poll with
+        ``get_batch_transfer_status``, or ``ASYNC_SUBMIT_FAILED``."""
+        try:
+            batch_id = self.engine.batch_transfer_async_write(
+                session_id, buffers, peer_buffer_addresses, lengths
+            )
+        except Exception:
+            batch_id = 0
+            if not self.supports_async_transfer():
+                raise RuntimeError(
+                    "Mooncake's async batch transfer requires a newer "
+                    "mooncake-transfer-engine. Please upgrade Mooncake by "
+                    "'pip install mooncake-transfer-engine --upgrade'"
+                )
+
+        if batch_id <= 0:
+            logger.debug(
+                "Failed to submit async batch transfer. Buffers: %s, Session: %s, "
+                "Peer addresses: %s",
+                buffers,
+                session_id,
+                peer_buffer_addresses,
+            )
+            return self.ASYNC_SUBMIT_FAILED
+        return batch_id
+
+    def get_batch_transfer_status(self, batch_ids: List[int]) -> int:
+        """0 once every batch completed, negative on failure / timeout, positive
+        while a non-blocking binding still has batches in flight."""
+        try:
+            ret = self.engine.get_batch_transfer_status(batch_ids)
+        except Exception:
+            ret = -1
+
+        if ret < 0:
+            logger.debug("Async batch transfer failed. Batch ids: %s", batch_ids)
         return ret
 
     def get_session_id(self):

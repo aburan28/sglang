@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import os
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.overrides import (
@@ -20,24 +19,24 @@ logger = logging.getLogger(__name__)
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
-    # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
-    # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
-    # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.
+    # "mooncake_tcp" / "mooncake_dpdk" are mooncake with a non-RDMA transport
+    # forced (MC_FORCE_TCP / MOONCAKE_PROTOCOL=dpdk); both rewrite the backend to
+    # mooncake and skip RDMA HCA selection. Must run before backend-name checks.
     if cfg.disaggregation_transfer_backend == "mooncake_tcp":
-        os.environ.setdefault("MC_FORCE_TCP", "1")
-        declare_resolution(
-            server_args,
-            "handle_pd_disaggregation",
-            disaggregation_transfer_backend="mooncake",
-        )
-        declare_resolution(
-            server_args,
-            "handle_pd_disaggregation",
-            disaggregation_ib_device=None,
-        )
+        # Envs.set writes os.environ, so the scheduler subprocesses inherit it.
+        if not envs.MC_FORCE_TCP.is_set():
+            envs.MC_FORCE_TCP.set(True)
+        _resolve_mooncake_non_rdma_alias(server_args)
         logger.info(
             "disaggregation transfer backend 'mooncake_tcp' -> mooncake "
-            "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
+            "with MC_FORCE_TCP set (TCP transport, no RDMA)"
+        )
+    elif cfg.disaggregation_transfer_backend == "mooncake_dpdk":
+        envs.MOONCAKE_PROTOCOL.set("dpdk")
+        _resolve_mooncake_non_rdma_alias(server_args)
+        logger.info(
+            "disaggregation transfer backend 'mooncake_dpdk' -> mooncake "
+            "with MOONCAKE_PROTOCOL=dpdk (DPDK transport, no RDMA)"
         )
 
     if cfg.disaggregation_mode == "prefill" and cfg.dcp_size > 1:
@@ -144,6 +143,19 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                 f"got '{cfg.disaggregation_transfer_backend}'."
             )
+
+
+def _resolve_mooncake_non_rdma_alias(server_args: ServerArgs) -> None:
+    declare_resolution(
+        server_args,
+        "handle_pd_disaggregation",
+        disaggregation_transfer_backend="mooncake",
+    )
+    declare_resolution(
+        server_args,
+        "handle_pd_disaggregation",
+        disaggregation_ib_device=None,
+    )
 
 
 def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:

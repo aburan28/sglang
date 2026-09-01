@@ -208,6 +208,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 
         manager = object.__new__(MooncakeKVManager)
+        manager.is_page_major_kv = False
         manager.kv_args = SimpleNamespace(
             kv_data_ptrs=[1000, 2000, 3000],
             kv_item_lens=[100, 100, 100],
