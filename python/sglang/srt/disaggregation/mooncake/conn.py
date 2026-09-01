@@ -220,6 +220,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._async_outstanding = 0
         self._async_outstanding_lock = threading.Lock()
         self.enable_async_transfer = self._resolve_async_transfer()
+        # Newer wheels add a non-blocking poll / free pair; without it the poll
+        # loop falls back to the blocking get_batch_transfer_status.
+        self.use_nonblocking_poll = (
+            self.enable_async_transfer and self.engine.supports_nonblocking_poll()
+        )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -670,13 +675,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self._async_outstanding -= 1
 
     def _poll_async_batch(self, batch_id: int) -> int:
+        nonblocking = self.use_nonblocking_poll
         backoff = ASYNC_POLL_MIN_SLEEP_S
         while True:
-            status = self.engine.get_batch_transfer_status([batch_id])
+            if nonblocking:
+                status = self.engine.batch_transfer_poll([batch_id])[0]
+            else:
+                status = self.engine.get_batch_transfer_status([batch_id])
             if status <= 0:
-                return status
+                break
             time.sleep(backoff)
             backoff = min(backoff * 2, ASYNC_POLL_MAX_SLEEP_S)
+        if nonblocking:
+            # The blocking status call frees the id itself; the poll does not.
+            self.engine.batch_transfer_free([batch_id])
+        return status
 
     def _send_kvcache_generic(
         self,

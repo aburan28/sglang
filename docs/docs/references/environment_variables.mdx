@@ -1445,7 +1445,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGGREGATION_ASYNC_TRANSFER</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Mooncake backend: submit KV batches with <code>batch_transfer_async_write</code> and poll <code>get_batch_transfer_status</code> instead of blocking a worker thread per batch. Falls back to synchronous transfers on a Mooncake wheel without the async API.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Mooncake backend: submit KV batches with <code>batch_transfer_async_write</code> and poll for completion (non-blocking <code>batch_transfer_poll</code> on wheels that have it, else <code>get_batch_transfer_status</code>) instead of blocking a worker thread per batch. Falls back to synchronous transfers on a Mooncake wheel without the async API.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>

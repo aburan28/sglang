@@ -324,6 +324,34 @@ class MooncakeTransferEngine:
             logger.debug("Async batch transfer failed. Batch ids: %s", batch_ids)
         return ret
 
+    def supports_nonblocking_poll(self) -> bool:
+        """Whether the installed mooncake wheel exposes the non-blocking
+        ``batch_transfer_poll`` / ``batch_transfer_free`` pair."""
+        return hasattr(self.engine, "batch_transfer_poll") and hasattr(
+            self.engine, "batch_transfer_free"
+        )
+
+    def batch_transfer_poll(self, batch_ids: List[int]) -> List[int]:
+        """Non-blocking status per batch: 0 completed, 1 in flight, negative
+        on failure / timeout. Leaves the ids allocated for
+        ``batch_transfer_free``."""
+        try:
+            statuses = list(self.engine.batch_transfer_poll(batch_ids))
+        except Exception:
+            statuses = [-1] * len(batch_ids)
+
+        if any(status < 0 for status in statuses):
+            logger.debug("Async batch transfer failed. Batch ids: %s", batch_ids)
+        return statuses
+
+    def batch_transfer_free(self, batch_ids: List[int]) -> None:
+        """Release batch ids that ``batch_transfer_poll`` reported terminal;
+        call it once per id."""
+        try:
+            self.engine.batch_transfer_free(batch_ids)
+        except Exception:
+            logger.debug("Failed to free async batch ids: %s", batch_ids)
+
     def get_session_id(self):
         return self.session_id
 
