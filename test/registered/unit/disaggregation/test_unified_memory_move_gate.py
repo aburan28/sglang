@@ -13,6 +13,7 @@ corruption with no crash.
 import unittest
 from typing import List, Optional, Set
 
+from sglang.srt.disaggregation.fake.conn import FakeKVManager
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     unified_memory_disagg_move_gate,
@@ -48,12 +49,28 @@ class _FakePreallocQueue:
         )
 
 
+class _FakeKVManager:
+    """Mirrors MooncakeKVManager's async-batch accounting."""
+
+    def __init__(self):
+        self.outstanding = 0
+
+    def outstanding_async_transfers(self) -> int:
+        return self.outstanding
+
+
+class _FakeBootstrapQueue:
+    def __init__(self, kv_manager):
+        self.kv_manager = kv_manager
+
+
 class _FakeScheduler:
     def __init__(self, mode: DisaggregationMode):
         self.disaggregation_mode = mode
         self.chunked_req: Optional[object] = None
         self.disagg_prefill_inflight_queue: List[object] = []
         self.disagg_prefill_pending_chunk_rids: Set[str] = set()
+        self.disagg_prefill_bootstrap_queue = _FakeBootstrapQueue(_FakeKVManager())
         self.disagg_decode_transfer_queue = _FakeTransferQueue()
         self.disagg_decode_prealloc_queue = _FakePreallocQueue()
 
@@ -131,6 +148,33 @@ class TestPrefillMoveGate(CustomTestCase):
         scheduler.chunked_req = None
         scheduler.disagg_prefill_pending_chunk_rids.discard("r0")
         self.assertTrue(gate(), "abort cleanup must let compaction resume")
+
+
+class TestPrefillMoveGateAsyncTransfers(CustomTestCase):
+    def test_closed_while_async_batches_are_outstanding(self):
+        """With the submit/poll data plane a transfer worker can still be
+        polling a batch after the scheduler retired the request (a failed room
+        leaves the inflight queue at once), so queue emptiness alone would
+        reopen the gate under an in-flight read of the source pages."""
+        scheduler = _FakeScheduler(DisaggregationMode.PREFILL)
+        kv_manager = scheduler.disagg_prefill_bootstrap_queue.kv_manager
+        gate = unified_memory_disagg_move_gate(scheduler)
+        self.assertTrue(gate())
+
+        kv_manager.outstanding = 1
+        self.assertFalse(scheduler.disagg_prefill_inflight_queue)
+        self.assertFalse(scheduler.disagg_prefill_pending_chunk_rids)
+        self.assertFalse(gate())
+
+        kv_manager.outstanding = 0
+        self.assertTrue(gate())
+
+    def test_backend_without_async_data_plane_reports_zero(self):
+        """Backends without a submit/poll data plane inherit BaseKVManager's
+        default; a non-zero default would close the gate for the process
+        lifetime on a synchronous backend."""
+        manager = FakeKVManager.__new__(FakeKVManager)
+        self.assertEqual(manager.outstanding_async_transfers(), 0)
 
 
 class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):

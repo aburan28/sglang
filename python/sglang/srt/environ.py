@@ -647,6 +647,9 @@ class Envs:
     # below fires. Off by default (no behavior/perf impact when disabled).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # Submit/poll KV transfers (batch_transfer_async + get_batch_transfer_status)
+    # instead of blocking a worker per batch; needs the async API in mooncake.
+    SGLANG_DISAGGREGATION_ASYNC_TRANSFER = EnvBool(False)
 
     # ===================================================================
     # Distributed and model-parallel runtime
@@ -706,6 +709,9 @@ class Envs:
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
+    # "posix" keeps the file backend's default client; "io_uring" selects the
+    # local io_uring client (mooncake.uring) for the hf3fs backend.
+    SGLANG_HICACHE_FILE_BACKEND_IO = EnvStr("posix")
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
 
     # ===================================================================
@@ -723,6 +729,15 @@ class Envs:
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
+    # Upstream MC_ knobs of the Mooncake transport. Mooncake keys MC_FORCE_TCP
+    # on presence, so unset it rather than setting it to false.
+    MC_FORCE_TCP = EnvBool(False)
+    # Data plane of the tcp transport: asio | io_uring.
+    MC_TCP_IO_BACKEND = EnvStr(None)
+    # dmabuf zero copy on the tcp transport (kernel >= 6.16, HDS-capable NIC).
+    MC_TCP_ZC = EnvBool(False)
+    # DPDK ports; presence enables the dpdk transport.
+    MC_DPDK_PORTS = EnvStr(None)
 
     # ===================================================================
     # Mooncake store
