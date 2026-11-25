@@ -81,7 +81,8 @@ if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
-    from sglang.srt.mem_cache.memory_pool import KVCache
+
+from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +238,10 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_layout_page_major = (
+            isinstance(self.token_to_kv_pool, KVCache)
+            and self.token_to_kv_pool.kv_layout_page_major
+        )
         kv_args.kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
             if self.draft_token_to_kv_pool is None

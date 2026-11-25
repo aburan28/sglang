@@ -1673,6 +1673,9 @@ class KVCache(abc.ABC):
     # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
     # state lives on the request pool instead, and the caller has to move it.
     cpu_copy_carries_mamba: bool = False
+    # PD transfer registers ONE whole-envelope region (item_len = bytes of one
+    # page across all layers and K/V); see PageMajorMHATokenToKVPool.
+    kv_layout_page_major: bool = False
 
     @abc.abstractmethod
     def __init__(
@@ -3196,6 +3199,8 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
     mis-indexing the strided views.
     """
 
+    kv_layout_page_major = True
+
     def __init__(
         self,
         *args,
@@ -3235,7 +3240,10 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
             v_head_dim=self.v_head_dim,
             itemsize=self.store_dtype.itemsize,
         )
-        total_bytes = num_pages * self.page_size * entry_bytes
+        self.num_pages = num_pages
+        # One page's bytes across all layers and K/V: the PD transfer item_len.
+        self.page_bytes = self.page_size * entry_bytes
+        total_bytes = num_pages * self.page_bytes
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -3310,11 +3318,10 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
     # token-major. Inheriting them would silently mis-index; fail loudly instead.
 
     def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "page-major layout has no per-layer contiguous regions; KV transfer / "
-            "disaggregation is unsupported (TODO: expose the single _raw buffer "
-            "with a page-aware transfer scheme)."
-        )
+        """One whole-envelope region: ``_raw`` with ``item_len`` = bytes of one
+        page across all layers and K/V, so ``ptr + page_index * item_len`` is
+        that page's ``[L0_K | L0_V | L1_K | ...]`` envelope."""
+        return [self._raw.data_ptr()], [self._raw.numel()], [self.page_bytes]
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError(

@@ -73,6 +73,11 @@ FAILED_SESSION_RECOVERIES = Counter(
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
 
+# Async data-plane poll backoff: short start keeps small batches snappy, the
+# cap keeps a long transfer from spinning a core.
+ASYNC_POLL_MIN_SLEEP_S = 50e-6
+ASYNC_POLL_MAX_SLEEP_S = 2e-3
+
 
 # decode
 @dataclasses.dataclass
@@ -210,6 +215,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
+        # Batches submitted but not yet terminal; read by the unified memory
+        # move gate to keep compaction off the source pages while in flight.
+        self._async_outstanding = 0
+        self._async_outstanding_lock = threading.Lock()
+        self.enable_async_transfer = self._resolve_async_transfer()
+        # Newer wheels add a non-blocking poll / free pair; without it the poll
+        # loop falls back to the blocking get_batch_transfer_status.
+        self.use_nonblocking_poll = (
+            self.enable_async_transfer and self.engine.supports_nonblocking_poll()
+        )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -284,6 +299,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
+
+    def _resolve_async_transfer(self) -> bool:
+        if not envs.SGLANG_DISAGGREGATION_ASYNC_TRANSFER.get():
+            return False
+        if not self.engine.supports_async_transfer():
+            logger.warning(
+                "SGLANG_DISAGGREGATION_ASYNC_TRANSFER is set but the installed "
+                "mooncake-transfer-engine has no batch_transfer_async_write / "
+                "get_batch_transfer_status; falling back to synchronous transfers."
+            )
+            return False
+        return True
+
+    def outstanding_async_transfers(self) -> int:
+        """Async batches submitted but not yet at a terminal status."""
+        with self._async_outstanding_lock:
+            return self._async_outstanding
 
     def _registerable_regions(self) -> List[Tuple[int, int]]:
         """(ptr, len) regions to (de)register, exact duplicates removed.
@@ -610,9 +642,54 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
+        return self._transfer_lists(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
+
+    def _transfer_lists(
+        self,
+        mooncake_session_id: str,
+        src_addrs: List[int],
+        dst_addrs: List[int],
+        lengths: List[int],
+    ) -> int:
+        """Write ``src_addrs[i]`` -> ``dst_addrs[i]`` on the peer; 0 on success,
+        negative on failure (the ``batch_transfer_sync`` convention)."""
+        if not self.enable_async_transfer:
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addrs, dst_addrs, lengths
+            )
+        # Counted before submit so the move gate never sees a submitted batch
+        # as idle; released once the terminal status is known.
+        with self._async_outstanding_lock:
+            self._async_outstanding += 1
+        try:
+            batch_id = self.engine.batch_transfer_async(
+                mooncake_session_id, src_addrs, dst_addrs, lengths
+            )
+            if batch_id < 0:
+                return -1
+            return self._poll_async_batch(batch_id)
+        finally:
+            with self._async_outstanding_lock:
+                self._async_outstanding -= 1
+
+    def _poll_async_batch(self, batch_id: int) -> int:
+        nonblocking = self.use_nonblocking_poll
+        backoff = ASYNC_POLL_MIN_SLEEP_S
+        while True:
+            if nonblocking:
+                status = self.engine.batch_transfer_poll([batch_id])[0]
+            else:
+                status = self.engine.get_batch_transfer_status([batch_id])
+            if status <= 0:
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2, ASYNC_POLL_MAX_SLEEP_S)
+        if nonblocking:
+            # The blocking status call frees the id itself; the poll does not.
+            self.engine.batch_transfer_free([batch_id])
+        return status
 
     def _send_kvcache_generic(
         self,
@@ -683,6 +760,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     for layer_id in range(layers_current_pp_stage)
                 ]
         else:
+            if len(src_data_ptrs) == 1:
+                # A lone region is a whole-envelope layout; the K/V half-split
+                # below would pair zero layers and report an empty transfer.
+                raise RuntimeError(
+                    "Single KV region without kv_layout_page_major: the page-major "
+                    "flag must be set on both PD peers."
+                )
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
@@ -769,17 +853,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     ) -> None:
         """Reject a peer whose KV registration shape differs from ours.
 
-        The unified memory pool registers ONE whole-envelope region and
-        addresses the destination as ``dst_ptr + page_id * item_len`` using OUR
-        ``item_len``, so a peer on a different page size / spec, or without
-        unified memory, would take envelope-sized blocks at the wrong offsets.
-        Must run before the first RDMA write.
+        The whole-envelope layouts (the unified memory pool, the page-major MHA
+        pool) register ONE region and address the destination as
+        ``dst_ptr + page_id * item_len`` using OUR ``item_len``, so a peer on a
+        different page size / spec, or on a per-layer layout, would take
+        envelope-sized blocks at the wrong offsets. Must run before the first
+        RDMA write.
 
-        Scoped to unified memory by config, not by region count: a non-unified
-        PP stage owning a single full-attention layer also registers one region,
+        Scoped by config / pool layout, not by region count: a non-unified PP
+        stage owning a single full-attention layer also registers one region,
         and `_send_kvcache_generic` pairs that with the peer by layer id.
         """
-        if not get_memory().enable_unified_memory:
+        if not (self.is_page_major_kv or get_memory().enable_unified_memory):
             return
         if dst_attn_tp_size is not None and self.attn_tp_size != dst_attn_tp_size:
             # The unified mamba state ships as one whole-slot envelope with no
@@ -787,10 +872,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # silently falls back to an unsliced copy. Reject here, before any KV
             # is written, rather than in `maybe_send_extra` afterwards.
             raise RuntimeError(
-                "--enable-unified-memory does not support different prefill / "
-                f"decode attention TP sizes (prefill={self.attn_tp_size}, "
-                f"decode={dst_attn_tp_size}): the whole-envelope state cannot "
-                "be TP-resliced."
+                "The whole-envelope KV layout (--enable-unified-memory / "
+                "page-major) does not support different prefill / decode "
+                f"attention TP sizes (prefill={self.attn_tp_size}, "
+                f"decode={dst_attn_tp_size}): the envelope cannot be "
+                "TP-resliced."
             )
         src_item_lens = self.kv_args.kv_item_lens
         if (
@@ -803,8 +889,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 "PD KV layout mismatch on the whole-envelope path: prefill has "
                 f"{len(src_item_lens)} KV region(s) with item_lens="
                 f"{src_item_lens}, decode has {len(dst_kv_ptrs)} with item_len="
-                f"{dst_kv_item_len}. With --enable-unified-memory both sides "
-                "must enable it and use the same page size and model spec."
+                f"{dst_kv_item_len}. Both sides must use the same whole-envelope "
+                "layout (--enable-unified-memory or the page-major KV layout), "
+                "page size and model spec."
             )
 
     def _await_transfer_futures(self, futures) -> int:
@@ -860,6 +947,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
+            # The page-major pool is one region for all layers and K/V, so it
+            # takes the flat (one descriptor list per region) branch.
+            force_flat=self.is_page_major_kv,
             src_layer_ids=self.kv_args.kv_layer_ids,
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
@@ -1065,7 +1155,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
             length_list = [heads_bytes_per_token_to_send] * total_slices
-            return self.engine.batch_transfer_sync(
+            return self._transfer_lists(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
 
@@ -1753,6 +1843,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                            )
+                        elif self.is_page_major_kv:
+                            # The staging / slice paths address per-layer K/V
+                            # rows; a whole-envelope page cannot be TP-resliced.
+                            raise RuntimeError(
+                                "The page-major KV layout requires equal prefill "
+                                "/ decode attention TP sizes (prefill="
+                                f"{self.attn_tp_size}, decode="
+                                f"{target_rank_registration_info.dst_attn_tp_size})."
                             )
                         elif (
                             self.enable_staging

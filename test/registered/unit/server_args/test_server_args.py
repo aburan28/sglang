@@ -734,6 +734,47 @@ class TestLoadBalanceMethod(unittest.TestCase):
             "mooncake",
         )
 
+    def test_pd_mooncake_tcp_alias_forces_tcp_through_envs(self):
+        with patch.dict(os.environ):
+            envs.MC_FORCE_TCP.clear()
+            server_args = self._load_balance_args(
+                disaggregation_mode="decode",
+                disaggregation_transfer_backend="mooncake_tcp",
+                disaggregation_ib_device="mlx5_0",
+            )
+            # Written through Envs so scheduler subprocesses inherit it.
+            self.assertTrue(envs.MC_FORCE_TCP.is_set())
+            self.assertTrue(envs.MC_FORCE_TCP.get())
+            self.assertEqual(
+                resolution_result(server_args, "disaggregation_transfer_backend"),
+                "mooncake",
+            )
+            self.assertIsNone(
+                resolution_result(server_args, "disaggregation_ib_device")
+            )
+
+    def test_pd_mooncake_dpdk_alias_selects_dpdk_protocol(self):
+        self.assertIn(
+            "mooncake_dpdk", server_args_module.DISAGG_TRANSFER_BACKEND_CHOICES
+        )
+        with patch.dict(os.environ):
+            envs.MOONCAKE_PROTOCOL.clear()
+            envs.MC_FORCE_TCP.clear()
+            server_args = self._load_balance_args(
+                disaggregation_mode="decode",
+                disaggregation_transfer_backend="mooncake_dpdk",
+                disaggregation_ib_device="mlx5_0",
+            )
+            self.assertEqual(envs.MOONCAKE_PROTOCOL.get(), "dpdk")
+            self.assertFalse(envs.MC_FORCE_TCP.is_set())
+            self.assertEqual(
+                resolution_result(server_args, "disaggregation_transfer_backend"),
+                "mooncake",
+            )
+            self.assertIsNone(
+                resolution_result(server_args, "disaggregation_ib_device")
+            )
+
 
 class TestSkipTokenizerInit(unittest.TestCase):
     def test_skip_tokenizer_worker_counts(self):

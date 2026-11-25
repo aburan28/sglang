@@ -129,13 +129,19 @@ def unified_memory_disagg_move_gate(scheduler):
     - DECODE: `pop_preallocated` publishes one request's destinations and keeps
       allocating for the next, whose allocation can urgently flush the peer
       sub-allocator; the batch reaches the transfer queue only after the loop.
+    - PREFILL, async data plane: a transfer worker that submitted a batch and
+      is still polling it holds the source pages even after the scheduler has
+      retired the request (failure / abort paths), so the gate also waits for
+      the KV manager's outstanding async batches to drain.
     """
     if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
 
         def prefill_gate() -> bool:
+            kv_manager = scheduler.disagg_prefill_bootstrap_queue.kv_manager
             return not (
                 scheduler.disagg_prefill_inflight_queue
                 or scheduler.disagg_prefill_pending_chunk_rids
+                or kv_manager.outstanding_async_transfers() > 0
             )
 
         return prefill_gate

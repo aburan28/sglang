@@ -60,6 +60,9 @@ class KVArgs:
     # Number of rows before the slice axis in each per-slot state tensor.
     state_slice_outer_counts: List[List[int]]
     is_hybrid_mla_backend: bool
+    # One whole-envelope KV region (all layers' K/V of a page contiguous, item_len
+    # = page bytes; PageMajorMHATokenToKVPool). Both PD peers must agree.
+    kv_layout_page_major: bool = False
     # Per-tensor conv sub-block dims (GDN: [key_dim, key_dim, value_dim]) so the
     # scatter transfer can slice each independently head-sharded sub-block; None
     # per tensor when the single contiguous slice already matches the layout.
@@ -114,6 +117,12 @@ class BaseKVManager(ABC):
     def register_to_bootstrap(self):
         """Register prefill server info to the bootstrap server."""
         ...
+
+    def outstanding_async_transfers(self) -> int:
+        """Submitted-but-not-terminal async batches; the unified memory move
+        gate holds compaction while non-zero. Backends without a submit/poll
+        data plane keep this default."""
+        return 0
 
 
 class BaseKVSender(ABC):

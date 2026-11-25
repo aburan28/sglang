@@ -13,6 +13,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
@@ -137,6 +138,34 @@ def synchronized():
     return _decorator
 
 
+HF3FS_CLIENT_KINDS = ("usrbio", "uring", "mock")
+
+
+def resolve_hf3fs_client_kind(
+    client: Optional[str] = None, use_mock: bool = False
+) -> str:
+    """An explicit ``client`` (extra config) wins, then
+    ``SGLANG_HICACHE_FILE_BACKEND_IO`` picks ``uring`` (io_uring) or ``usrbio``."""
+    if use_mock:
+        return "mock"
+    if client:
+        kind = client.lower()
+        if kind not in HF3FS_CLIENT_KINDS:
+            raise ValueError(
+                f"Unknown hf3fs client {client!r}; expected one of {HF3FS_CLIENT_KINDS}"
+            )
+        return kind
+    io_backend = envs.SGLANG_HICACHE_FILE_BACKEND_IO.get()
+    if io_backend == "io_uring":
+        return "uring"
+    if io_backend != "posix":
+        raise ValueError(
+            f"Unknown SGLANG_HICACHE_FILE_BACKEND_IO={io_backend!r}; "
+            "expected 'posix' or 'io_uring'"
+        )
+    return "usrbio"
+
+
 def create_hf3fs_client(
     path: str,
     size: int,
@@ -144,6 +173,7 @@ def create_hf3fs_client(
     entries: int,
     client_timeout: int,
     use_mock: bool = False,
+    client: Optional[str] = None,
 ) -> Hf3fsClient:
     """Factory function to create appropriate HF3FS client.
 
@@ -153,14 +183,23 @@ def create_hf3fs_client(
         bytes_per_page: Bytes per page
         entries: Number of entries for batch operations
         use_mock: Whether to use mock client instead of real usrbio client
+        client: ``usrbio`` (3FS), ``uring`` (local file over io_uring) or
+            ``mock``; None resolves from SGLANG_HICACHE_FILE_BACKEND_IO
 
     Returns:
     """
-    if use_mock:
+    kind = resolve_hf3fs_client_kind(client=client, use_mock=use_mock)
+    if kind == "mock":
         from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsMockClient
 
         logger.info(f"[Rank Using Hf3fsMockClient for testing")
         return Hf3fsMockClient(path, size, bytes_per_page, entries)
+    elif kind == "uring":
+        from sglang.srt.mem_cache.storage.hf3fs.uring_local_client import (
+            UringLocalClient,
+        )
+
+        return UringLocalClient(path, size, bytes_per_page, entries)
     else:
         from sglang.srt.mem_cache.storage.hf3fs.hf3fs_usrbio_client import (
             Hf3fsUsrBioClient,
@@ -201,6 +240,7 @@ class HiCacheHF3FS(HiCacheStorage):
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
         enable_storage_metrics: bool = False,
+        client: Optional[str] = None,
     ):
         self.rank = rank
         self.file_path = file_path
@@ -216,6 +256,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.is_page_first_layout = is_page_first_layout
         self.enable_storage_metrics = enable_storage_metrics
         self.use_mock_client = use_mock_client
+        self.client_kind = client
         self.numel = self.bytes_per_page // self.dtype.itemsize
         self.num_pages = self.file_size // self.bytes_per_page
         self.skip_backup = False
@@ -242,6 +283,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 self.entries,
                 self.client_timeout,
                 use_mock_client,
+                client=self.client_kind,
             )
             for _ in range(numjobs)
         ]
@@ -285,6 +327,7 @@ class HiCacheHF3FS(HiCacheStorage):
         )
 
         use_mock_client = False
+        client_kind = None
         if storage_config is not None:
             rank, is_mla_model, is_page_first_layout = (
                 storage_config.tp_rank,
@@ -296,6 +339,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 use_mock_client = storage_config.extra_config.get(
                     "use_mock_hf3fs_client", False
                 )
+                client_kind = storage_config.extra_config.get("client")
         else:
             rank, is_mla_model, is_page_first_layout = (
                 0,
@@ -322,6 +366,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 metadata_client=Hf3fsLocalMetadataClient(),
                 is_page_first_layout=is_page_first_layout,
                 use_mock_client=use_mock_client,
+                client=client_kind,
             )
 
         try:
@@ -374,6 +419,7 @@ class HiCacheHF3FS(HiCacheStorage):
             is_page_first_layout=is_page_first_layout,
             use_mock_client=use_mock_client,
             enable_storage_metrics=storage_config.enable_storage_metrics,
+            client=client_kind,
         )
 
     def _batch_get(
@@ -574,6 +620,25 @@ class HiCacheHF3FS(HiCacheStorage):
         self.mha_zero_copy = self.is_zero_copy and not self.is_mla_model
 
         logger.info(f"{self.is_zero_copy=}, layout={self.mem_pool_host.layout}")
+        self._maybe_register_uring_host_buffer(mem_pool_host)
+
+    def _maybe_register_uring_host_buffer(self, mem_pool_host: HostKVCache) -> None:
+        from sglang.srt.mem_cache.storage.hf3fs.uring_local_client import (
+            UringLocalClient,
+        )
+
+        if not self.clients or not isinstance(self.clients[0], UringLocalClient):
+            return
+        # The host pool's stride alignment decides O_DIRECT; the pinned pool is
+        # the ring's fixed buffer (a list-valued kv_buffer stays unregistered).
+        aligned = mem_pool_host.is_stride_page_aligned(4096)
+        for client in self.clients:
+            client.set_page_aligned_hint(aligned)
+        kv_buffer = mem_pool_host.kv_buffer
+        if isinstance(kv_buffer, torch.Tensor):
+            UringLocalClient.register_buffer(
+                kv_buffer.data_ptr(), kv_buffer.numel() * kv_buffer.element_size()
+            )
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if host_pool_name == PoolName.KV:
@@ -594,6 +659,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 self.entries,
                 self.client_timeout,
                 self.use_mock_client,
+                client=self.client_kind,
             )
             for _ in range(self.numjobs)
         ]

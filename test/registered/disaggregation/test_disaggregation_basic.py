@@ -32,7 +32,15 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=730, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=850, stage="base-b", runner_config="2-gpu-large")
+
+
+def _mooncake_supports_iouring_tcp() -> bool:
+    try:
+        import mooncake.engine as mooncake_engine
+    except ImportError:
+        return False
+    return bool(getattr(mooncake_engine, "SUPPORT_IOURING_TCP", False))
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
@@ -226,6 +234,66 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             except Exception as health_check_error:
                 # If health check fails, re-raise the original exception
                 raise e from health_check_error
+
+
+class TestDisaggregationMooncakeTcpUring(PDDisaggregationServerBase):
+    """Mooncake TCP transport on its io_uring data plane (MC_TCP_IO_BACKEND).
+
+    Skipped when the installed mooncake wheel was built without the io_uring
+    TCP backend (no ``SUPPORT_IOURING_TCP`` on ``mooncake.engine``): the
+    transport would silently stay on asio and the test would cover nothing new.
+    """
+
+    _uring_ctx = None
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if not _mooncake_supports_iouring_tcp():
+            raise unittest.SkipTest("mooncake.engine lacks SUPPORT_IOURING_TCP")
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        # Plain TCP between the two GPUs of the runner, no RDMA HCA.
+        cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake_tcp"]
+        cls.rdma_devices = []
+        # Entered before launch_all() so both server subprocesses inherit it.
+        cls._uring_ctx = envs.MC_TCP_IO_BACKEND.override("io_uring")
+        cls._uring_ctx.__enter__()
+        cls.launch_all()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._uring_ctx is not None:
+            cls._uring_ctx.__exit__(None, None, None)
+            cls._uring_ctx = None
+        super().tearDownClass()
+
+    def test_generate_over_io_uring_tcp(self):
+        response = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("Paris", response.json()["text"])
+
+    def test_batch_generate_completes(self):
+        prompts = [f"Write number {i} in words:" for i in range(8)]
+        response = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "text": prompts,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 32},
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        results = response.json()
+        self.assertEqual(len(results), len(prompts))
+        for result in results:
+            self.assertEqual(result["meta_info"]["finish_reason"]["type"], "length")
+        assert_process_healthy(self, "prefill", self.process_prefill, self.prefill_url)
+        assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
 
 
 class TestDisaggregationMooncakeSpec(

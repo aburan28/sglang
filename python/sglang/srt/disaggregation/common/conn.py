@@ -162,6 +162,7 @@ class CommonKVManager(BaseKVManager):
         # MHA never replicates, so it stays pinned at 1.
         self._kv_replica_factor: Optional[int] = None if is_mla_backend else 1
         self.is_hybrid_mla_backend = getattr(args, "is_hybrid_mla_backend", False)
+        self.is_page_major_kv = args.kv_layout_page_major
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
         self.enable_deferred_decode_kv_release = (

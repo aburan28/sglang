@@ -301,6 +301,7 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
     "fake",
     "mori",
     "mooncake_tcp",
+    "mooncake_dpdk",
 ]
 add_disagg_transfer_backend_choices = DISAGG_TRANSFER_BACKEND_CHOICES.extend
 
@@ -1101,7 +1102,7 @@ class ServerArgs:
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,
-        "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",
+        "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp / mooncake_dpdk); mori/nixl support will be added later by the community.",
         NS("parallel"),
     ] = False
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True), NS("parallel")] = (
@@ -5958,7 +5959,7 @@ class ServerArgs:
                 ):
                     raise ValueError(
                         "--enable-dsa-cache-layer-split currently only supports "
-                        "the mooncake transfer backend (mooncake / mooncake_tcp). "
+                        "the mooncake transfer backend (mooncake / mooncake_tcp / mooncake_dpdk). "
                         f"Got --disaggregation-transfer-backend "
                         f"{cfg.disaggregation_transfer_backend!r}. mori/nixl "
                         "support will be added later by the community."
